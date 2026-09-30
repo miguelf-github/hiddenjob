@@ -29,6 +29,27 @@ UA = "Hiddenjob/0.1 (research-and-review)"
 # follow (non-nofollow) link-back attribution wherever their data is shown.
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+def _secret_from_file(name: str) -> str:
+    """Read a KEY=VALUE secret from ~/.config/hiddenjob.env (chmod 600).
+
+    Local fallback so API keys never have to be exported in the shell or
+    hardcoded. Returns "" when the file or key is absent.
+    """
+    path = os.path.expanduser("~/.config/hiddenjob.env")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip() == name:
+                    return value.strip().strip("\"").strip("'")
+    except OSError:
+        pass
+    return ""
 PERM_MARKERS = [
     (r"\bforeign\s+equivalent\b", 3),
     (r"\bin the job offered\b", 3),
@@ -273,12 +294,16 @@ def arbeitnow_jobs(limit: int = 100, timeout: int = 25) -> list[dict[str, object
     return records
 
 
-def usajobs_jobs(limit: int = 50, timeout: int = 25, api_key: str = "", keyword: str = "") -> list[dict[str, object]]:
+def usajobs_jobs(limit: int = 50, timeout: int = 25, api_key: str = "",
+                 keyword: str = "", user_agent_email: str = "") -> list[dict[str, object]]:
     """Fetch federal postings from the USAJOBS search API.
 
-    Requires a free API key (https://api.data.gov/signup/ — USAJOBS accepts
-    api.data.gov keys). The key is never hardcoded; pass it in or set the env
-    var named by the source's api_key_env. Without a key, returns [].
+    Requires a free API key (https://developer.usajobs.gov/apirequest/ --
+    USAJOBS also accepts api.data.gov keys). The key is never hardcoded; pass
+    it in or set the env var named by the source's api_key_env. USAJOBS-issued
+    keys additionally require the User-Agent header to be the registration
+    email; pass it as user_agent_email (or leave "" for the default UA).
+    Without a key, returns [].
     Shape is defensive: SearchResult.SearchResultItems[].MatchedObjectDescriptor.
     """
     if not api_key:
@@ -289,7 +314,7 @@ def usajobs_jobs(limit: int = 50, timeout: int = 25, api_key: str = "", keyword:
     url = "https://data.usajobs.gov/api/search?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={
         "Host": "data.usajobs.gov",
-        "User-Agent": UA,
+        "User-Agent": user_agent_email or UA,
         "Authorization-Key": api_key,
         "Accept": "application/json",
     })
@@ -331,6 +356,147 @@ def usajobs_jobs(limit: int = 50, timeout: int = 25, api_key: str = "", keyword:
             "description_sha256": hashlib.sha256(description.encode()).hexdigest(),
             **classify(description),
         })
+    return records[:limit]
+
+
+def adzuna_jobs(limit: int = 50, timeout: int = 25, app_id: str = "",
+                app_key: str = "", keyword: str = "", location: str = "") -> list[dict[str, object]]:
+    """Fetch US postings from the Adzuna search API (broad aggregator coverage).
+
+    Free app_id/app_key from https://developer.adzuna.com/signup
+    (no card; 25/min, 250/day, 2500/month). results_per_page maxes at 50.
+    Salary caveat: Adzuna predicts a range when the posting states none
+    (salary_is_predicted); predicted ranges are labeled as estimates and never
+    presented as employer-stated pay.
+    """
+    if not app_id or not app_key:
+        return []
+    params = {
+        "app_id": app_id,
+        "app_key": app_key,
+        "results_per_page": str(max(1, min(limit, 50))),
+        "content-type": "application/json",
+    }
+    if keyword:
+        params["what"] = keyword
+    if location:
+        params["where"] = location
+    url = "https://api.adzuna.com/v1/api/jobs/us/search/1?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            if response.status != 200:
+                raise FetchBlocked(f"adzuna: HTTP {response.status}")
+            data = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        print(f"adzuna: HTTP {exc.code}", file=sys.stderr)
+        return []
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        print(f"adzuna: {exc}", file=sys.stderr)
+        return []
+    results = data.get("results", []) if isinstance(data, dict) else []
+    records: list[dict[str, object]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "Untitled posting")
+        company = str((item.get("company") or {}).get("display_name") or "")
+        loc = str((item.get("location") or {}).get("display_name") or "")
+        desc = clean_text(str(item.get("description") or ""))
+        contract = str(item.get("contract_time") or "").replace("_", " ")
+        smin, smax = item.get("salary_min"), item.get("salary_max")
+        predicted = str(item.get("salary_is_predicted") or "") == "1"
+        pay_note = ""
+        if isinstance(smin, (int, float)) and isinstance(smax, (int, float)) and (smin or smax):
+            tag = "Adzuna estimate" if predicted else "stated"
+            # Adzuna sometimes reports hourly figures; tiny values are hourly, not yearly.
+            per = "/hr" if smax < 500 else "/yr"
+            pay_note = f" Pay: ${smin:,.0f}-${smax:,.0f}{per} ({tag})."
+        parts = [p for p in [f"{title} at {company}".strip(), loc, contract] if p]
+        description = clean_text(". ".join(parts) + "." + pay_note + " " + desc)
+        records.append({
+            "url": str(item.get("redirect_url") or ""),
+            "source": "adzuna",
+            "title": title[:300],
+            "company": company[:300],
+            "date_posted": str(item.get("created") or ""),
+            "description": description,
+            "description_sha256": hashlib.sha256(description.encode()).hexdigest(),
+            **classify(description),
+        })
+    return records[:limit]
+
+
+def jsearch_jobs(limit: int = 30, timeout: int = 25, api_key: str = "",
+                 keyword: str = "", location: str = "") -> list[dict[str, object]]:
+    """Fetch US postings via JSearch (RapidAPI), aggregating Google for Jobs
+    results (Indeed, LinkedIn, Glassdoor, ZipRecruiter, company sites).
+
+    Key from https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch (free tier
+    ~200 req/month). Key travels in the X-RapidAPI-Key header. JSearch serves
+    ~10 results/page, so pages are capped at 3 per sync to protect the quota.
+    Full descriptions come back inline; salary periods (HOUR/YEAR/...) are
+    preserved for pay-floor filtering.
+    """
+    if not api_key:
+        return []
+    query = keyword.strip()
+    if location:
+        query = f"{query} in {location}".strip()
+    pages = max(1, min(3, (limit + 9) // 10))
+    records: list[dict[str, object]] = []
+    for page in range(1, pages + 1):
+        params = {"query": query or "jobs", "page": str(page), "country": "us",
+                  "date_posted": "month"}
+        url = "https://jsearch.p.rapidapi.com/search?" + urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA,
+                "X-RapidAPI-Key": api_key,
+                "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                if response.status != 200:
+                    raise FetchBlocked(f"jsearch: HTTP {response.status}")
+                data = json.loads(response.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            print(f"jsearch: HTTP {exc.code}", file=sys.stderr)
+            return records
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            print(f"jsearch: {exc}", file=sys.stderr)
+            return records
+        items = data.get("data", []) if isinstance(data, dict) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("job_title") or "Untitled posting")
+            company = str(item.get("employer_name") or "")
+            city = str(item.get("job_city") or "")
+            state = str(item.get("job_state") or "")
+            loc = ", ".join(p for p in [city, state] if p) or str(item.get("job_country") or "")
+            desc = clean_text(str(item.get("job_description") or ""))
+            etype = str(item.get("job_employment_type") or "").replace("_", " ")
+            smin, smax, period = item.get("job_min_salary"), item.get("job_max_salary"), str(item.get("job_salary_period") or "")
+            pay_note = ""
+            if isinstance(smin, (int, float)) and isinstance(smax, (int, float)) and (smin or smax):
+                per = {"YEAR": "/yr", "MONTH": "/mo", "WEEK": "/wk", "DAY": "/day", "HOUR": "/hr"}.get(period, "")
+                pay_note = f" Pay: ${smin:,.0f}-${smax:,.0f}{per} (stated)."
+            parts = [p for p in [f"{title} at {company}".strip(), loc, etype] if p]
+            description = clean_text(". ".join(parts) + "." + pay_note + " " + desc)
+            apply = str(item.get("job_apply_link") or item.get("job_google_link") or "")
+            records.append({
+                "url": apply,
+                "source": "jsearch",
+                "title": title[:300],
+                "company": company[:300],
+                "date_posted": str(item.get("job_posted_at_datetime_utc") or ""),
+                "description": description,
+                "description_sha256": hashlib.sha256(description.encode()).hexdigest(),
+                **classify(description),
+            })
+            if len(records) >= limit:
+                return records
     return records[:limit]
 
 
@@ -789,20 +955,59 @@ def cmd_sync(args: argparse.Namespace) -> int:
             print(f"{name}: api={kind}, captured={len(records)}")
             continue
         if kind == "usajobs":
-            # USAJOBS needs a free API key (https://api.data.gov/signup/).
-            # Read from the env var named by api_key_env; never hardcoded.
+            # USAJOBS needs a free API key (https://developer.usajobs.gov/apirequest/).
+            # Read from the env var named by api_key_env, falling back to
+            # ~/.config/hiddenjob.env (chmod 600); never hardcoded.
             env_name = str(source.get("api_key_env") or "USAJOBS_API_KEY")
-            api_key = os.environ.get(env_name, "")
+            api_key = os.environ.get(env_name, "") or _secret_from_file(env_name)
+            ua_email = os.environ.get("USAJOBS_USER_AGENT_EMAIL", "") or _secret_from_file("USAJOBS_USER_AGENT_EMAIL")
             if not api_key:
                 print(f"{name}: no USAJOBS API key in ${env_name}; skipping source, preserving existing rows.", file=sys.stderr)
                 continue
             uj_limit = int(source.get("limit") or args.limit or 50)
-            records = usajobs_jobs(limit=uj_limit, api_key=api_key, keyword=str(source.get("keyword") or ""))
+            records = usajobs_jobs(limit=uj_limit, api_key=api_key, keyword=str(source.get("keyword") or ""),
+                                 user_agent_email=ua_email)
             for record in records:
                 record["evidence_text"] = record.get("description", "")
                 store_job(con, root, record)
             con.commit()
             print(f"{name}: api=usajobs, captured={len(records)}")
+            continue
+        if kind == "adzuna":
+            # Adzuna: free app_id/app_key (https://developer.adzuna.com/signup).
+            # Read from env, falling back to ~/.config/hiddenjob.env (chmod 600).
+            app_id = os.environ.get("ADZUNA_APP_ID", "") or _secret_from_file("ADZUNA_APP_ID")
+            app_key = os.environ.get("ADZUNA_APP_KEY", "") or _secret_from_file("ADZUNA_APP_KEY")
+            if not app_id or not app_key:
+                print(f"{name}: no Adzuna credentials (ADZUNA_APP_ID/ADZUNA_APP_KEY); skipping source, preserving existing rows.", file=sys.stderr)
+                continue
+            az_limit = int(source.get("limit") or args.limit or 50)
+            records = adzuna_jobs(limit=az_limit, app_id=app_id, app_key=app_key,
+                                  keyword=str(source.get("keyword") or ""),
+                                  location=str(source.get("location") or ""))
+            for record in records:
+                record["evidence_text"] = record.get("description", "")
+                store_job(con, root, record)
+            con.commit()
+            print(f"{name}: api=adzuna, captured={len(records)}")
+            continue
+        if kind == "jsearch":
+            # JSearch (RapidAPI): key in X-RapidAPI-Key header. Free tier
+            # ~200 req/month, so pages are capped inside jsearch_jobs.
+            env_name = str(source.get("api_key_env") or "JSEARCH_API_KEY")
+            js_key = os.environ.get(env_name, "") or _secret_from_file(env_name)
+            if not js_key:
+                print(f"{name}: no JSearch API key in ${env_name}; skipping source, preserving existing rows.", file=sys.stderr)
+                continue
+            js_limit = int(source.get("limit") or args.limit or 30)
+            records = jsearch_jobs(limit=js_limit, api_key=js_key,
+                                   keyword=str(source.get("keyword") or ""),
+                                   location=str(source.get("location") or ""))
+            for record in records:
+                record["evidence_text"] = record.get("description", "")
+                store_job(con, root, record)
+            con.commit()
+            print(f"{name}: api=jsearch, captured={len(records)}")
             continue
         direct_urls = source_direct_urls(source, cfg_path)
         seeds = source_sitemap_seeds(source, cfg_path)
@@ -884,14 +1089,24 @@ def cmd_sync(args: argparse.Namespace) -> int:
             target_limit = int(target.get("limit") or args.limit)
         except (TypeError, ValueError):
             target_limit = args.limit
-        for posting in postings[:target_limit]:
+        # Optional per-target keyword filter: when present, only postings
+        # whose title contains one of the keywords (case-insensitive) are
+        # stored. Boards can list hundreds of roles; without this the limit
+        # would truncate before the relevant ones are seen.
+        keywords = [k.strip().lower() for k in (target.get("keywords") or [])
+                    if isinstance(k, str) and k.strip()]
+        matched = postings
+        if keywords:
+            matched = [p for p in postings
+                       if any(k in str(p.get("title") or "").lower() for k in keywords)]
+        for posting in matched[:target_limit]:
             posting = dict(posting)
             posting["source"] = label
             posting["evidence_is_json"] = True
             store_job(con, root, posting)
             captured += 1
         con.commit()
-        print(f"{label} ({company or 'unknown company'}): board_postings={len(postings)}, captured={captured}, truncated={len(postings) > target_limit}")
+        print(f"{label} ({company or 'unknown company'}): board_postings={len(postings)}, matched={len(matched)}, captured={captured}, truncated={len(matched) > target_limit}")
     return 0
 
 

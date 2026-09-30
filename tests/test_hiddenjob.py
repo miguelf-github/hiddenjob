@@ -225,6 +225,31 @@ class HiddenjobTests(unittest.TestCase):
             con = sqlite3.connect(root / "ledger" / "hiddenjob.sqlite3")
             self.assertTrue(con.execute("SELECT evidence_path FROM jobs").fetchone()[0].endswith(".json"))
 
+    def test_sync_ats_keyword_filter_keeps_only_matching_titles(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); (root / "config").mkdir()
+            config = root / "config" / "targets.json"
+            registry = root / "config" / "targets-local.json"
+            registry.write_text(json.dumps({"targets": [
+                {"company": "Acme", "ats": {"kind": "ashby", "board": "acme"},
+                 "keywords": ["data annotator", "data quality"]},
+            ]}))
+            config.write_text(json.dumps({"data_dir": "ledger", "sources": [], "ats_targets_file": "targets-local.json"}))
+            postings = [
+                {"url": "https://jobs.ashbyhq.com/acme/1", "title": "Data Annotator", "company": "Acme",
+                 "date_posted": "", "description": "Label things", "evidence_text": "{}"},
+                {"url": "https://jobs.ashbyhq.com/acme/2", "title": "Backend Engineer", "company": "Acme",
+                 "date_posted": "", "description": "Build services", "evidence_text": "{}"},
+                {"url": "https://jobs.ashbyhq.com/acme/3", "title": "DATA QUALITY Lead", "company": "Acme",
+                 "date_posted": "", "description": "Own quality", "evidence_text": "{}"},
+            ]
+            args = argparse.Namespace(config=str(config), limit=10, max_sitemap_urls=10)
+            with mock.patch.object(hiddenjob, "ats_board_postings", return_value=postings):
+                self.assertEqual(hiddenjob.cmd_sync(args), 0)
+            rows = sqlite3.connect(root / "ledger" / "hiddenjob.sqlite3").execute("SELECT title FROM jobs").fetchall()
+            titles = sorted(r[0] for r in rows)
+            self.assertEqual(titles, ["DATA QUALITY Lead", "Data Annotator"])
+
 
 RANK_SPEC = importlib.util.spec_from_file_location("hiddenjob_rank", Path(__file__).parents[1] / "tools" / "hiddenjob_rank.py")
 ranker = importlib.util.module_from_spec(RANK_SPEC)
