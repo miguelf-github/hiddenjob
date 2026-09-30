@@ -1,10 +1,12 @@
 import argparse
 import importlib.util
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -439,6 +441,164 @@ class FeedSourceTests(unittest.TestCase):
         self.assertEqual(records[0]["title"], "IT Specialist")
         self.assertEqual(records[0]["company"], "Department of Testing")
         self.assertEqual(records[0]["source"], "usajobs")
+
+    def test_usajobs_uses_shim_without_key(self):
+        body = json.dumps({"SearchResult": {"SearchResultItems": []}}).encode()
+        resp = mock.MagicMock()
+        resp.status = 200
+        resp.read.return_value = body
+        ctx = mock.MagicMock()
+        ctx.__enter__.return_value = resp
+        with mock.patch.dict(os.environ,
+                             {"USAJOBS_SHIM_URL": "http://127.0.0.1:18711"}):
+            with mock.patch.object(hiddenjob.urllib.request, "urlopen",
+                                   return_value=ctx) as uo:
+                records = hiddenjob.usajobs_jobs(limit=10)
+        req = uo.call_args[0][0]
+        self.assertTrue(
+            req.full_url.startswith("http://127.0.0.1:18711/api/search"))
+        self.assertIsNone(req.get_header("Authorization-Key"))
+        self.assertEqual(records, [])
+
+    def test_usajobs_site_parses_execute_search(self):
+        body = json.dumps({
+            "Total": "2",
+            "Pager": {"HasNextPage": False, "CurrentPageIndex": 1},
+            "Jobs": [{
+                "DocumentID": 884340100,
+                "Title": "Civil Engineer",
+                "Agency": "U.S. Army Corps of Engineers",
+                "Department": "Department of the Army",
+                "LocationDisplay": "Okinawa, Japan",
+                "SalaryDisplay": "Starting at $98,000 Per year",
+                "PositionStartDate": "2026-09-15T00:00:00",
+                "PositionEndDate": "2026-12-12T23:59:59.9970",
+                "PositionID": "CEDD-26-13055626-DHA",
+                "PositionURI": "https://www.usajobs.gov:443/job/884340100",
+                "HiringPath": [{"SearchDisplay": "Open to the public"}],
+                "WorkSchedule": "Full-time",
+                "WorkType": "Permanent",
+            }],
+        }).encode()
+        resp = mock.MagicMock()
+        resp.status = 200
+        resp.read.return_value = body
+        ctx = mock.MagicMock()
+        ctx.__enter__.return_value = resp
+        with mock.patch.object(hiddenjob.urllib.request, "urlopen",
+                               return_value=ctx) as uo:
+            records = hiddenjob.usajobs_site_jobs(limit=10, keyword="engineer")
+        req = uo.call_args[0][0]
+        self.assertEqual(
+            req.full_url, "https://www.usajobs.gov/Search/ExecuteSearch")
+        self.assertEqual(req.get_method(), "POST")
+        sent = json.loads(req.data.decode())
+        self.assertEqual(sent["Keyword"], "engineer")
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["title"], "Civil Engineer")
+        self.assertEqual(rec["company"], "U.S. Army Corps of Engineers")
+        self.assertEqual(rec["url"], "https://www.usajobs.gov/job/884340100")
+        self.assertEqual(rec["source"], "usajobs")
+        self.assertIn("Okinawa, Japan", rec["description"])
+        self.assertIn("$98,000", rec["description"])
+
+    def test_usajobs_falls_back_to_site_on_api_401(self):
+        site_body = json.dumps({
+            "Total": "1",
+            "Pager": {"HasNextPage": False},
+            "Jobs": [{
+                "DocumentID": 1,
+                "Title": "Site Engineer",
+                "Agency": "Test Agency",
+                "PositionURI": "https://www.usajobs.gov/job/1",
+            }],
+        }).encode()
+        site_resp = mock.MagicMock()
+        site_resp.status = 200
+        site_resp.read.return_value = site_body
+        site_ctx = mock.MagicMock()
+        site_ctx.__enter__.return_value = site_resp
+        err = urllib.error.HTTPError(
+            "http://127.0.0.1:18711/api/search", 401, "Unauthorized", {}, None)
+        with mock.patch.dict(os.environ,
+                             {"USAJOBS_SHIM_URL": "http://127.0.0.1:18711"}):
+            with mock.patch.object(hiddenjob.urllib.request, "urlopen",
+                                   side_effect=[err, site_ctx]) as uo:
+                records = hiddenjob.usajobs_jobs(limit=10, keyword="engineer")
+        self.assertEqual(uo.call_count, 2)
+        site_req = uo.call_args[0][0]
+        self.assertEqual(
+            site_req.full_url, "https://www.usajobs.gov/Search/ExecuteSearch")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["title"], "Site Engineer")
+
+
+class UsajobsHistoricTests(unittest.TestCase):
+    def _ctx(self, body: bytes, status: int = 200):
+        resp = mock.MagicMock()
+        resp.status = status
+        resp.read.return_value = body
+        ctx = mock.MagicMock()
+        ctx.__enter__.return_value = resp
+        return ctx
+
+    def test_historic_parses_records(self):
+        body = json.dumps({"data": [{
+            "usajobsControlNumber": 875973400,
+            "positionTitle": "IT Specialist",
+            "hiringAgencyName": "Test Agency",
+            "hiringDepartmentName": "Department of Testing",
+            "positionOpenDate": "2026-09-28",
+            "positionCloseDate": "2026-10-12",
+            "minimumSalary": 80000,
+            "maximumSalary": 120000,
+            "salaryType": "Per Year",
+            "teleworkEligible": "Y",
+            "securityClearance": "Secret",
+            "whoMayApply": "U.S. Citizens",
+            "announcementNumber": "TEST-001",
+            "positionlocations": [{
+                "positionLocationCity": "San Francisco",
+                "positionLocationState": "California",
+                "positionLocationCountry": "United States"}],
+        }]}).encode()
+        with mock.patch.object(hiddenjob.urllib.request, "urlopen",
+                               return_value=self._ctx(body)) as uo:
+            records = hiddenjob.usajobs_historic_jobs(limit=50, days_back=3)
+        req = uo.call_args[0][0]
+        self.assertIn("data.usajobs.gov/api/historicjoa", req.full_url)
+        self.assertIn("StartPositionOpenDate=", req.full_url)
+        self.assertIsNone(req.get_header("Authorization-Key"))
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["title"], "IT Specialist")
+        self.assertEqual(rec["company"], "Test Agency")
+        self.assertEqual(rec["url"], "https://www.usajobs.gov/job/875973400")
+        self.assertEqual(rec["source"], "usajobs")
+        self.assertIn("Telework: Y", rec["description"])
+        self.assertIn("San Francisco, California", rec["description"])
+
+    def test_historic_keyword_filter(self):
+        body = json.dumps({"data": [
+            {"usajobsControlNumber": 1, "positionTitle": "Nurse",
+             "hiringAgencyName": "VA"},
+            {"usajobsControlNumber": 2, "positionTitle": "IT Specialist",
+             "hiringAgencyName": "Test Agency"},
+        ]}).encode()
+        with mock.patch.object(hiddenjob.urllib.request, "urlopen",
+                               return_value=self._ctx(body)):
+            records = hiddenjob.usajobs_historic_jobs(keyword="nurse")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["title"], "Nurse")
+
+    def test_historic_empty_slice(self):
+        with mock.patch.object(hiddenjob.urllib.request, "urlopen",
+                               return_value=self._ctx(b"204 No Content")):
+            self.assertEqual(hiddenjob.usajobs_historic_jobs(), [])
+        with mock.patch.object(hiddenjob.urllib.request, "urlopen",
+                               return_value=self._ctx(b'{"data": []}')):
+            self.assertEqual(hiddenjob.usajobs_historic_jobs(), [])
 
 
 class AtsAdapterTests(unittest.TestCase):

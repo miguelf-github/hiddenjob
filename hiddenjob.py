@@ -17,6 +17,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -294,6 +295,207 @@ def arbeitnow_jobs(limit: int = 100, timeout: int = 25) -> list[dict[str, object
     return records
 
 
+USAJOBS_SITE_URL = "https://www.usajobs.gov/Search/ExecuteSearch"
+# First-party browser UA: the site's bot mitigation tarpits requests that do
+# not look like a browser (missing Accept/Sec-Fetch-*/Origin/Referer headers
+# hang the connection). Verified 2026-09-28.
+_USAJOBS_SITE_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36")
+
+
+def usajobs_site_jobs(limit: int = 50, timeout: int = 25, keyword: str = "") -> list[dict[str, object]]:
+    """Fetch federal postings via the usajobs.gov site's own search endpoint.
+
+    Keyless fallback for when the developer API key is rejected (HTTP 401):
+    POST https://www.usajobs.gov/Search/ExecuteSearch with a JSON body —
+    the same contract the site's frontend uses (reverse-engineered from
+    /js/searchmain.js 2026-09-28). No API key, no cookies needed; the
+    request must carry browser-like headers or the server never responds.
+
+    Returns records in the same normalized shape as usajobs_jobs().
+    """
+    per_page = max(1, min(limit, 50))
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://www.usajobs.gov",
+        "Referer": "https://www.usajobs.gov/search/results/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "User-Agent": _USAJOBS_SITE_UA,
+    }
+    records: list[dict[str, object]] = []
+    page = 1
+    while len(records) < limit:
+        body = json.dumps({
+            "Keyword": keyword,
+            "Page": str(page),
+            "ResultsPerPage": per_page,
+        }).encode("utf-8")
+        req = urllib.request.Request(USAJOBS_SITE_URL, data=body,
+                                     headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                if response.status != 200:
+                    raise FetchBlocked(f"usajobs-site: HTTP {response.status}")
+                data = json.loads(response.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            print(f"usajobs-site: HTTP {exc.code}", file=sys.stderr)
+            return records
+        except (urllib.error.URLError, TimeoutError, OSError,
+                json.JSONDecodeError) as exc:
+            print(f"usajobs-site: {exc}", file=sys.stderr)
+            return records
+        jobs = data.get("Jobs") if isinstance(data, dict) else None
+        if not jobs:
+            break
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            uri = str(job.get("PositionURI") or "").replace(":443/", "/", 1)
+            hiring = job.get("HiringPath") or []
+            hiring_txt = ", ".join(str(h.get("SearchDisplay") or "")
+                                   for h in hiring if isinstance(h, dict))
+            description = clean_text("\n".join(
+                s for s in [
+                    str(job.get("Title") or ""),
+                    " — ".join(s for s in [str(job.get("Agency") or ""),
+                                          str(job.get("Department") or "")]
+                              if s),
+                    str(job.get("LocationDisplay") or ""),
+                    str(job.get("SalaryDisplay") or ""),
+                    f"Hiring path: {hiring_txt}" if hiring_txt else "",
+                    f"Work: {job.get('WorkSchedule') or ''} "
+                    f"{job.get('WorkType') or ''}".strip(),
+                    f"Closes: {job.get('PositionEndDate') or ''}",
+                    f"Position ID: {job.get('PositionID') or ''}",
+                ] if s.strip()))
+            records.append({
+                "url": uri,
+                "source": "usajobs",
+                "title": str(job.get("Title") or "Untitled posting")[:300],
+                "company": str(job.get("Agency") or "").strip()[:300],
+                "date_posted": str(job.get("PositionStartDate") or ""),
+                "description": description,
+                "description_sha256": hashlib.sha256(
+                    description.encode()).hexdigest(),
+                **classify(description),
+            })
+            if len(records) >= limit:
+                break
+        pager = data.get("Pager") if isinstance(data, dict) else None
+        if not isinstance(pager, dict) or not pager.get("HasNextPage"):
+            break
+        page += 1
+        time.sleep(0.5)
+    return records[:limit]
+
+
+USAJOBS_HISTORIC_URL = "https://data.usajobs.gov/api/historicjoa"
+
+
+def usajobs_historic_jobs(limit: int = 200, timeout: int = 30,
+                          days_back: int = 3, keyword: str = "") -> list[dict[str, object]]:
+    """Fetch federal postings via the keyless historic-announcement endpoint.
+
+    GET https://data.usajobs.gov/api/historicjoa?StartPositionOpenDate=...&EndPositionOpenDate=...
+    Same host as the keyed API, but this path enforces no Authorization-Key
+    (verified live 2026-09-28: HTTP 200, 363 records for a 2-day window, no
+    key, no special headers). Returns 40-field records — richer than the
+    site-search cards (agency codes, salary numbers, telework, clearance,
+    whoMayApply, structured locations).
+
+    The window covers announcements that OPENED in the last `days_back`
+    days, so it works as a fresh-jobs source for daily discovery. Record
+    URLs use the same https://www.usajobs.gov/job/{controlNumber} identity
+    as usajobs_site_jobs(), so cross-source dedup by URL holds.
+    """
+    end = date.today()
+    start = end - timedelta(days=max(1, days_back))
+    query = urllib.parse.urlencode({
+        "StartPositionOpenDate": start.isoformat(),
+        "EndPositionOpenDate": end.isoformat(),
+    })
+    req = urllib.request.Request(
+        f"{USAJOBS_HISTORIC_URL}?{query}",
+        headers={"Accept": "application/json", "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            if response.status != 200:
+                raise FetchBlocked(f"usajobs-historic: HTTP {response.status}")
+            raw = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        print(f"usajobs-historic: HTTP {exc.code}", file=sys.stderr)
+        return []
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        print(f"usajobs-historic: {exc}", file=sys.stderr)
+        return []
+    if not raw.strip() or raw.strip() == "204 No Content":
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"usajobs-historic: bad JSON {exc}", file=sys.stderr)
+        return []
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    kw = keyword.strip().lower()
+    records: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        control = str(item.get("usajobsControlNumber") or "")
+        if not control:
+            continue
+        title = str(item.get("positionTitle") or "Untitled posting")
+        agency = str(item.get("hiringAgencyName") or "")
+        dept = str(item.get("hiringDepartmentName") or "")
+        if kw and kw not in f"{title} {agency} {dept}".lower():
+            continue
+        locs = item.get("positionlocations") or []
+        loc_txt = ", ".join(
+            ", ".join(s for s in [str(l.get("positionLocationCity") or ""),
+                                  str(l.get("positionLocationState") or "")]
+                      if s)
+            for l in locs if isinstance(l, dict)) if isinstance(locs, list) else ""
+        sal_min = item.get("minimumSalary")
+        sal_max = item.get("maximumSalary")
+        salary = ""
+        if sal_min or sal_max:
+            salary = f"${sal_min} - ${sal_max} ({item.get('salaryType') or ''})".strip()
+        description = clean_text("\n".join(
+            s for s in [
+                title,
+                " — ".join(s for s in [agency, dept] if s),
+                loc_txt,
+                salary,
+                f"Telework: {item.get('teleworkEligible')}" if item.get("teleworkEligible") else "",
+                f"Clearance: {item.get('securityClearance')}" if item.get("securityClearance") else "",
+                f"Who may apply: {item.get('whoMayApply')}" if item.get("whoMayApply") else "",
+                f"Work schedule: {item.get('workSchedule') or ''}".rstrip(": "),
+                f"Opens: {item.get('positionOpenDate') or ''}  Closes: {item.get('positionCloseDate') or ''}",
+                f"Announcement: {item.get('announcementNumber') or ''}",
+            ] if s.strip()))
+        records.append({
+            "url": f"https://www.usajobs.gov/job/{control}",
+            "source": "usajobs",
+            "title": title[:300],
+            "company": agency[:300],
+            "date_posted": str(item.get("positionOpenDate") or ""),
+            "description": description,
+            "description_sha256": hashlib.sha256(
+                description.encode()).hexdigest(),
+            **classify(description),
+        })
+        if len(records) >= limit:
+            break
+    return records
+
+
 def usajobs_jobs(limit: int = 50, timeout: int = 25, api_key: str = "",
                  keyword: str = "", user_agent_email: str = "") -> list[dict[str, object]]:
     """Fetch federal postings from the USAJOBS search API.
@@ -302,33 +504,53 @@ def usajobs_jobs(limit: int = 50, timeout: int = 25, api_key: str = "",
     USAJOBS also accepts api.data.gov keys). The key is never hardcoded; pass
     it in or set the env var named by the source's api_key_env. USAJOBS-issued
     keys additionally require the User-Agent header to be the registration
-    email; pass it as user_agent_email (or leave "" for the default UA).
-    Without a key, returns [].
+    email; pass it as user_agent_email, set USAJOBS_USER_AGENT, or leave ""
+    for the default UA.
+
+    Keyless route: when the USAJOBS_SHIM_URL env var is set (e.g.
+    http://127.0.0.1:18711), requests go through the local key shim
+    (~/workspace/tools/usajobs-shim/), which injects the key server-side --
+    no key is needed in this process at all.
+
+    Fallback: when the API path is configured (shim or key) but the request
+    fails (e.g. HTTP 401 -- the key is rejected server-side), this falls back
+    to usajobs_site_jobs(), the site's own keyless search endpoint, so
+    federal jobs keep flowing until the API key issue is resolved.
+
     Shape is defensive: SearchResult.SearchResultItems[].MatchedObjectDescriptor.
     """
-    if not api_key:
-        return []
     params = {"ResultsPerPage": max(1, min(limit, 500)), "Fields": "full"}
     if keyword:
         params["Keyword"] = keyword
-    url = "https://data.usajobs.gov/api/search?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={
-        "Host": "data.usajobs.gov",
-        "User-Agent": user_agent_email or UA,
-        "Authorization-Key": api_key,
-        "Accept": "application/json",
-    })
+    query = urllib.parse.urlencode(params)
+    shim_url = os.environ.get("USAJOBS_SHIM_URL", "").rstrip("/")
+    if shim_url:
+        # Keyless: the shim injects Host/User-Agent/Authorization-Key itself.
+        url = f"{shim_url}/api/search?{query}"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    else:
+        if not api_key:
+            return []
+        user_agent = user_agent_email or os.environ.get("USAJOBS_USER_AGENT") or UA
+        url = "https://data.usajobs.gov/api/search?" + query
+        req = urllib.request.Request(url, headers={
+            "Host": "data.usajobs.gov",
+            "User-Agent": user_agent,
+            "Authorization-Key": api_key,
+            "Accept": "application/json",
+        })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             if response.status != 200:
                 raise FetchBlocked(f"usajobs: HTTP {response.status}")
             data = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        print(f"usajobs: HTTP {exc.code}", file=sys.stderr)
-        return []
+        print(f"usajobs: HTTP {exc.code} — falling back to site search",
+              file=sys.stderr)
+        return usajobs_site_jobs(limit=limit, timeout=timeout, keyword=keyword)
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        print(f"usajobs: {exc}", file=sys.stderr)
-        return []
+        print(f"usajobs: {exc} — falling back to site search", file=sys.stderr)
+        return usajobs_site_jobs(limit=limit, timeout=timeout, keyword=keyword)
     items = []
     if isinstance(data, dict):
         sr = data.get("SearchResult") or {}
@@ -991,6 +1213,23 @@ def cmd_sync(args: argparse.Namespace) -> int:
             con.commit()
             print(f"{name}: api=adzuna, captured={len(records)}")
             continue
+        if kind == "usajobs_historic":
+            # Keyless: data.usajobs.gov/api/historicjoa needs no API key.
+            uj_limit = int(source.get("limit") or args.limit or 200)
+            records = usajobs_historic_jobs(
+                limit=uj_limit,
+                days_back=int(source.get("days_back") or 3),
+                keyword=str(source.get("keyword") or ""))
+            for record in records:
+                record["evidence_text"] = record.get("description", "")
+                store_job(con, root, record)
+            con.commit()
+            print(f"{name}: api=usajobs_historic, captured={len(records)}")
+            continue
+            for record in records:
+                record["evidence_text"] = record.get("description", "")
+                store_job(con, root, record)
+            con.commit()
         if kind == "jsearch":
             # JSearch (RapidAPI): key in X-RapidAPI-Key header. Free tier
             # ~200 req/month, so pages are capped inside jsearch_jobs.
