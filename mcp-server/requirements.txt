@@ -1,0 +1,3 @@
+# No runtime dependencies — the server is stdlib-only (Python 3.9+).
+# It speaks MCP 2024-11-05 over stdio using plain JSON-RPC 2.0, so no `mcp`
+# SDK install is needed. The official SDK remains optional and unused.
