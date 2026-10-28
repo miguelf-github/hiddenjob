@@ -649,6 +649,78 @@ def adzuna_jobs(limit: int = 50, timeout: int = 25, app_id: str = "",
     return records[:limit]
 
 
+def _normalize_jsearch_item(item: dict) -> dict[str, object]:
+    """Normalize one raw JSearch API item into a sync record."""
+    title = str(item.get("job_title") or "Untitled posting")
+    company = str(item.get("employer_name") or "")
+    city = str(item.get("job_city") or "")
+    state = str(item.get("job_state") or "")
+    loc = ", ".join(p for p in [city, state] if p) or str(item.get("job_country") or "")
+    desc = clean_text(str(item.get("job_description") or ""))
+    etype = str(item.get("job_employment_type") or "").replace("_", " ")
+    smin, smax, period = item.get("job_min_salary"), item.get("job_max_salary"), str(item.get("job_salary_period") or "")
+    pay_note = ""
+    if isinstance(smin, (int, float)) and isinstance(smax, (int, float)) and (smin or smax):
+        per = {"YEAR": "/yr", "MONTH": "/mo", "WEEK": "/wk", "DAY": "/day", "HOUR": "/hr"}.get(period, "")
+        pay_note = f" Pay: ${smin:,.0f}-${smax:,.0f}{per} (stated)."
+    parts = [p for p in [f"{title} at {company}".strip(), loc, etype] if p]
+    description = clean_text(". ".join(parts) + "." + pay_note + " " + desc)
+    apply = str(item.get("job_apply_link") or item.get("job_google_link") or "")
+    return {
+        "url": apply,
+        "source": "jsearch",
+        "title": title[:300],
+        "company": company[:300],
+        "date_posted": str(item.get("job_posted_at_datetime_utc") or ""),
+        "description": description,
+        "description_sha256": hashlib.sha256(description.encode()).hexdigest(),
+        **classify(description),
+    }
+
+
+def jsearch_records_via_skill(keyword: str = "", location: str = "", limit: int = 30) -> list[dict[str, object]]:
+    """Fetch JSearch results via the jsearch skill CLI (Secure Vault credential).
+
+    Fallback used when no raw JSEARCH_API_KEY is available in the environment
+    or ~/.config/hiddenjob.env. Returns normalized records in the same shape
+    as jsearch_jobs(). Empty list when the skill CLI is missing or fails.
+    """
+    import subprocess
+    query = keyword.strip()
+    if location:
+        query = f"{query} in {location}".strip()
+    cli = os.path.expanduser("~/workspace/skills/jsearch/bin/jsearch_search.py")
+    if not os.path.exists(cli):
+        return []
+    pages = max(1, min(3, (limit + 9) // 10))
+    try:
+        proc = subprocess.run(
+            [sys.executable, cli, "--query", query or "jobs", "--pages", str(pages)],
+            capture_output=True, text=True, timeout=150)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"jsearch skill CLI: {exc}", file=sys.stderr)
+        return []
+    if proc.returncode != 0:
+        print(f"jsearch skill CLI failed: {proc.stdout.strip()[:200]}", file=sys.stderr)
+        return []
+    try:
+        items = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        print("jsearch skill CLI: unparseable output", file=sys.stderr)
+        return []
+    if isinstance(items, dict):  # {"error": ...}
+        print(f"jsearch skill CLI: {items.get('error')}", file=sys.stderr)
+        return []
+    records = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        records.append(_normalize_jsearch_item(item))
+        if len(records) >= limit:
+            break
+    return records[:limit]
+
+
 def jsearch_jobs(limit: int = 30, timeout: int = 25, api_key: str = "",
                  keyword: str = "", location: str = "") -> list[dict[str, object]]:
     """Fetch US postings via JSearch (RapidAPI), aggregating Google for Jobs
@@ -667,10 +739,10 @@ def jsearch_jobs(limit: int = 30, timeout: int = 25, api_key: str = "",
         query = f"{query} in {location}".strip()
     pages = max(1, min(3, (limit + 9) // 10))
     records: list[dict[str, object]] = []
-    for page in range(1, pages + 1):
-        params = {"query": query or "jobs", "page": str(page), "country": "us",
+    for page in range(1, 2):  # search-v2 paginates via num_pages in one request
+        params = {"query": query or "jobs", "num_pages": str(pages), "country": "us",
                   "date_posted": "month"}
-        url = "https://jsearch.p.rapidapi.com/search?" + urllib.parse.urlencode(params)
+        url = "https://jsearch.p.rapidapi.com/search-v2?" + urllib.parse.urlencode(params)
         try:
             req = urllib.request.Request(url, headers={
                 "User-Agent": UA,
@@ -688,35 +760,12 @@ def jsearch_jobs(limit: int = 30, timeout: int = 25, api_key: str = "",
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             print(f"jsearch: {exc}", file=sys.stderr)
             return records
-        items = data.get("data", []) if isinstance(data, dict) else []
+        payload = data.get("data", {}) if isinstance(data, dict) else {}
+        items = payload.get("jobs", []) if isinstance(payload, dict) else payload
         for item in items:
             if not isinstance(item, dict):
                 continue
-            title = str(item.get("job_title") or "Untitled posting")
-            company = str(item.get("employer_name") or "")
-            city = str(item.get("job_city") or "")
-            state = str(item.get("job_state") or "")
-            loc = ", ".join(p for p in [city, state] if p) or str(item.get("job_country") or "")
-            desc = clean_text(str(item.get("job_description") or ""))
-            etype = str(item.get("job_employment_type") or "").replace("_", " ")
-            smin, smax, period = item.get("job_min_salary"), item.get("job_max_salary"), str(item.get("job_salary_period") or "")
-            pay_note = ""
-            if isinstance(smin, (int, float)) and isinstance(smax, (int, float)) and (smin or smax):
-                per = {"YEAR": "/yr", "MONTH": "/mo", "WEEK": "/wk", "DAY": "/day", "HOUR": "/hr"}.get(period, "")
-                pay_note = f" Pay: ${smin:,.0f}-${smax:,.0f}{per} (stated)."
-            parts = [p for p in [f"{title} at {company}".strip(), loc, etype] if p]
-            description = clean_text(". ".join(parts) + "." + pay_note + " " + desc)
-            apply = str(item.get("job_apply_link") or item.get("job_google_link") or "")
-            records.append({
-                "url": apply,
-                "source": "jsearch",
-                "title": title[:300],
-                "company": company[:300],
-                "date_posted": str(item.get("job_posted_at_datetime_utc") or ""),
-                "description": description,
-                "description_sha256": hashlib.sha256(description.encode()).hexdigest(),
-                **classify(description),
-            })
+            records.append(_normalize_jsearch_item(item))
             if len(records) >= limit:
                 return records
     return records[:limit]
@@ -1235,13 +1284,18 @@ def cmd_sync(args: argparse.Namespace) -> int:
             # ~200 req/month, so pages are capped inside jsearch_jobs.
             env_name = str(source.get("api_key_env") or "JSEARCH_API_KEY")
             js_key = os.environ.get(env_name, "") or _secret_from_file(env_name)
-            if not js_key:
-                print(f"{name}: no JSearch API key in ${env_name}; skipping source, preserving existing rows.", file=sys.stderr)
-                continue
             js_limit = int(source.get("limit") or args.limit or 30)
-            records = jsearch_jobs(limit=js_limit, api_key=js_key,
-                                   keyword=str(source.get("keyword") or ""),
-                                   location=str(source.get("location") or ""))
+            js_kw = str(source.get("keyword") or "")
+            js_loc = str(source.get("location") or "")
+            if js_key:
+                records = jsearch_jobs(limit=js_limit, api_key=js_key,
+                                       keyword=js_kw, location=js_loc)
+            else:
+                # Fall back to the Secure Vault credential via the jsearch skill CLI.
+                records = jsearch_records_via_skill(keyword=js_kw, location=js_loc, limit=js_limit)
+                if not records:
+                    print(f"{name}: no JSearch API key in ${env_name} and skill CLI returned nothing; skipping source, preserving existing rows.", file=sys.stderr)
+                    continue
             for record in records:
                 record["evidence_text"] = record.get("description", "")
                 store_job(con, root, record)
