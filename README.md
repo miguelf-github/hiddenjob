@@ -22,7 +22,7 @@
 >
 > Check out [Muse, your personal AI agent](https://muse.ai/join). Redeem this code in **Settings** within 48 hours of joining and we'll both get **1 billion Muse tokens**:
 >
-> Code: `FJBMD8`
+> Code: `YH7I4K`
 
 `hiddenjob` is a private, configuration-first toolkit for discovering job postings that are easy to miss, preserving the source evidence, and organizing a review-first application and accountability ledger.
 
